@@ -3,7 +3,9 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
+    "providers/index": "src/providers/index.ts",
     "providers/imessage/index": "src/providers/imessage/index.ts",
+    "providers/telegram/index": "src/providers/telegram/index.ts",
     "providers/terminal/index": "src/providers/terminal/index.ts",
     "providers/whatsapp-business/index":
       "src/providers/whatsapp-business/index.ts",
@@ -14,4 +16,5 @@ export default defineConfig({
   clean: true,
   outDir: "dist",
   target: "esnext",
+  external: ["ffmpeg-static"],
 });

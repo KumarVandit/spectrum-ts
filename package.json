@@ -1,22 +1,21 @@
 {
-  "private": true,
-  "packageManager": "bun@1.3.5",
-  "workspaces": [
-    "packages/*",
-    "examples/*"
-  ],
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
+    "@types/node": "^25.6.0",
     "turbo": "^2",
-    "ultracite": "7.4.3"
+    "ultracite": "7.7.0"
   },
+  "packageManager": "bun@1.3.5",
+  "private": true,
   "scripts": {
     "build": "turbo build",
     "dev": "turbo dev",
     "check": "ultracite check",
-    "fix": "ultracite fix"
+    "fix": "ultracite fix",
+    "gen:telegram": "bun run packages/spectrum-ts/src/providers/telegram/bot-api-spec/generators/typescript.ts"
   },
-  "dependencies": {
-    "@types/node": "^25.6.0"
-  }
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ]
 }

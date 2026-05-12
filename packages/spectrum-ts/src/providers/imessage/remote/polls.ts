@@ -1,0 +1,309 @@
+import type {
+  AdvancedIMessage,
+  Poll as IMessagePoll,
+  PollOption as IMessagePollOption,
+  PollChangeDelta,
+  PollEvent,
+} from "@photon-ai/advanced-imessage";
+import { asPoll, asPollOption, type PollChoice } from "../../../content/poll";
+import type { CachedPoll, PollCache, PollSelectionDelta } from "../cache";
+import type { IMessageMessage } from "../types";
+
+type VotedPollEvent = PollEvent & {
+  delta: Extract<PollChangeDelta, { type: "voted" }>;
+};
+
+type UnvotedPollEvent = PollEvent & {
+  delta: Extract<PollChangeDelta, { type: "unvoted" }>;
+};
+
+interface PollMetadataInput {
+  options: readonly IMessagePollOption[];
+  title: string;
+}
+
+interface PollOptionMessageInput {
+  cached: CachedPoll;
+  chatGuid: string;
+  event: Pick<PollEvent, "occurredAt" | "pollMessageGuid">;
+  optionId: string;
+  phone: string;
+  selected: boolean;
+  senderAddress: string;
+}
+
+interface PollOptionMessagesInput {
+  cached: CachedPoll;
+  chatGuid: string;
+  deltas: readonly PollSelectionDelta[];
+  event: Pick<PollEvent, "occurredAt" | "pollMessageGuid">;
+  phone: string;
+  senderAddress: string;
+}
+
+const isVotedPollEvent = (event: PollEvent): event is VotedPollEvent =>
+  event.delta.type === "voted";
+
+const isUnvotedPollEvent = (event: PollEvent): event is UnvotedPollEvent =>
+  event.delta.type === "unvoted";
+
+const toCachedPoll = (input: PollMetadataInput): CachedPoll => {
+  const poll = asPoll({
+    title: input.title,
+    options: input.options.map((optionInfo) => ({
+      title: optionInfo.text,
+    })),
+  });
+  const optionsByIdentifier = new Map<string, PollChoice>();
+  for (const [index, optionInfo] of input.options.entries()) {
+    const option = poll.options[index];
+    if (option && optionInfo.optionIdentifier) {
+      optionsByIdentifier.set(optionInfo.optionIdentifier, option);
+    }
+  }
+  return { poll, optionsByIdentifier };
+};
+
+const cachePollInfo = (cache: PollCache, info: IMessagePoll): CachedPoll => {
+  const cached = toCachedPoll(info);
+  cache.set(info.pollMessageGuid, cached);
+  return cached;
+};
+
+export const cachePollEvent = (
+  cache: PollCache,
+  event: PollEvent
+): CachedPoll | undefined => {
+  if (event.delta.type === "created" || event.delta.type === "optionAdded") {
+    try {
+      const cached = toCachedPoll({
+        title: event.delta.title,
+        options: event.delta.options,
+      });
+      cache.set(event.pollMessageGuid, cached);
+      return cached;
+    } catch (e) {
+      console.error("[spectrum-ts][imessage][poll] failed to cache poll", e);
+    }
+  }
+};
+
+const fetchPollInfo = async (
+  client: AdvancedIMessage,
+  cache: PollCache,
+  event: PollEvent
+): Promise<IMessagePoll | undefined> => {
+  try {
+    const info = await client.polls.get(event.pollMessageGuid);
+    cachePollInfo(cache, info);
+    return info;
+  } catch (e) {
+    console.error("[spectrum-ts][imessage][poll] failed to fetch poll", e);
+    return;
+  }
+};
+
+const resolvePoll = async (
+  client: AdvancedIMessage,
+  cache: PollCache,
+  event: PollEvent
+): Promise<CachedPoll | undefined> => {
+  const pollId = event.pollMessageGuid;
+  const cached = cache.get(pollId);
+  if (cached) {
+    return cached;
+  }
+  try {
+    const info = await client.polls.get(event.pollMessageGuid);
+    return cachePollInfo(cache, info);
+  } catch (e) {
+    console.error("[spectrum-ts][imessage][poll] failed to resolve poll", e);
+    return;
+  }
+};
+
+const buildPollOptionMessage = (
+  input: PollOptionMessageInput
+): IMessageMessage | undefined => {
+  const option = input.cached.optionsByIdentifier.get(input.optionId);
+  if (!option) {
+    return;
+  }
+  const action = input.selected ? "selected" : "deselected";
+  const eventTime = input.event.occurredAt.getTime();
+
+  return {
+    id: `${input.event.pollMessageGuid}:${input.senderAddress}:${input.optionId}:${action}:${eventTime}`,
+    sender: { id: input.senderAddress },
+    space: {
+      id: input.chatGuid,
+      type: input.chatGuid.includes(";+;") ? "group" : "dm",
+      phone: input.phone,
+    },
+    timestamp: input.event.occurredAt,
+    content: asPollOption({
+      option,
+      poll: input.cached.poll,
+      selected: input.selected,
+    }),
+  };
+};
+
+const buildPollOptionMessages = (
+  input: PollOptionMessagesInput
+): IMessageMessage[] => {
+  const messages: IMessageMessage[] = [];
+  for (const delta of input.deltas) {
+    const message = buildPollOptionMessage({
+      cached: input.cached,
+      chatGuid: input.chatGuid,
+      event: input.event,
+      optionId: delta.optionId,
+      phone: input.phone,
+      selected: delta.selected,
+      senderAddress: input.senderAddress,
+    });
+    if (message) {
+      messages.push(message);
+    }
+  }
+  return messages;
+};
+
+const allOptionIdsKnown = (
+  cached: CachedPoll,
+  optionIds: readonly string[]
+): boolean =>
+  optionIds.every((optionId) => cached.optionsByIdentifier.has(optionId));
+
+const refreshPollMetadata = async (
+  client: AdvancedIMessage,
+  pollCache: PollCache,
+  event: VotedPollEvent
+): Promise<CachedPoll | undefined> => {
+  const info = await fetchPollInfo(client, pollCache, event);
+  if (!info) {
+    return;
+  }
+  return pollCache.get(info.pollMessageGuid);
+};
+
+const toPollVoteMessages = async (
+  client: AdvancedIMessage,
+  pollCache: PollCache,
+  event: VotedPollEvent,
+  phone: string
+): Promise<IMessageMessage[]> => {
+  const senderAddress = event.actor?.address;
+  if (!senderAddress) {
+    return [];
+  }
+  const pollId = event.pollMessageGuid;
+  if (
+    pollCache.isStaleActorSelectionEvent(
+      pollId,
+      senderAddress,
+      event.occurredAt
+    )
+  ) {
+    return [];
+  }
+  const cached = await resolvePoll(client, pollCache, event);
+  if (!cached) {
+    return [];
+  }
+  const chatGuidStr = event.chatGuid;
+  const currentOptionIds = [event.delta.optionIdentifier];
+  let resolvedPoll = cached;
+
+  if (
+    currentOptionIds.some(
+      (optionId) => !resolvedPoll.optionsByIdentifier.has(optionId)
+    )
+  ) {
+    const snapshot = await refreshPollMetadata(client, pollCache, event);
+    if (snapshot) {
+      resolvedPoll = snapshot;
+    }
+  }
+
+  if (!allOptionIdsKnown(resolvedPoll, currentOptionIds)) {
+    return [];
+  }
+
+  const deltas = pollCache.actorSelectionDeltas(
+    pollId,
+    senderAddress,
+    currentOptionIds
+  );
+  const messages = buildPollOptionMessages({
+    cached: resolvedPoll,
+    chatGuid: chatGuidStr,
+    deltas,
+    event,
+    phone,
+    senderAddress,
+  });
+
+  pollCache.commitActorSelection(
+    pollId,
+    senderAddress,
+    currentOptionIds,
+    event.occurredAt
+  );
+
+  return messages;
+};
+
+const toPollUnvoteMessages = async (
+  client: AdvancedIMessage,
+  pollCache: PollCache,
+  event: UnvotedPollEvent,
+  phone: string
+): Promise<IMessageMessage[]> => {
+  const senderAddress = event.actor?.address;
+  if (!senderAddress) {
+    return [];
+  }
+  const pollId = event.pollMessageGuid;
+  if (
+    pollCache.isStaleActorSelectionEvent(
+      pollId,
+      senderAddress,
+      event.occurredAt
+    )
+  ) {
+    return [];
+  }
+  const cached = await resolvePoll(client, pollCache, event);
+  if (!cached) {
+    return [];
+  }
+  const chatGuidStr = event.chatGuid;
+  const deltas = pollCache.clearedActorSelectionDeltas(pollId, senderAddress);
+  const messages = buildPollOptionMessages({
+    cached,
+    chatGuid: chatGuidStr,
+    deltas,
+    event,
+    phone,
+    senderAddress,
+  });
+  pollCache.commitActorSelection(pollId, senderAddress, [], event.occurredAt);
+  return messages;
+};
+
+export const toPollDeltaMessages = async (
+  client: AdvancedIMessage,
+  pollCache: PollCache,
+  event: PollEvent,
+  phone: string
+): Promise<IMessageMessage[]> => {
+  if (isVotedPollEvent(event)) {
+    return toPollVoteMessages(client, pollCache, event, phone);
+  }
+  if (isUnvotedPollEvent(event)) {
+    return toPollUnvoteMessages(client, pollCache, event, phone);
+  }
+  return [];
+};

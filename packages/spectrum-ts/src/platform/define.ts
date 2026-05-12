@@ -1,36 +1,62 @@
 import type z from "zod";
-import { resolveContents } from "../content/resolve";
-import type { ContentInput } from "../content/types";
 import type { Message } from "../types/message";
 import type { Space } from "../types/space";
+import type { Store } from "../utils/store";
+import { buildSpace } from "./build";
 import type {
   AnyPlatformDef,
+  CreateClientContext,
+  EventProducer,
+  InboundPlatformMessage,
   Platform,
   PlatformDef,
   PlatformInstance,
   PlatformMessage,
   PlatformProviderConfig,
+  PlatformRuntime,
   PlatformSpace,
   PlatformUser,
   ProviderMessage,
   SpectrumLike,
 } from "./types";
 
+type NoInferValue<T> = [T][T extends unknown ? 0 : never];
+
 function createPlatformInstance<
   Def extends AnyPlatformDef,
   _Client,
   _ConfigSchema extends z.ZodType<object>,
->(
-  def: Def,
-  runtime: { client: unknown; config: unknown }
-): PlatformInstance<Def> {
-  const isPlatformUser = (value: unknown): value is PlatformUser<Def> => {
-    return (
-      typeof value === "object" &&
-      value !== null &&
-      "__platform" in value &&
-      (value as { __platform?: unknown }).__platform === def.name
-    );
+>(def: Def, runtime: PlatformRuntime): PlatformInstance<Def> {
+  const isPlatformUser = (value: unknown): value is PlatformUser<Def> =>
+    typeof value === "object" &&
+    value !== null &&
+    "__platform" in value &&
+    (value as { __platform?: unknown }).__platform === def.name;
+
+  const resolveUserID = async (userID: string): Promise<PlatformUser<Def>> => {
+    const resolved = await def.user.resolve({
+      input: { userID },
+      client: runtime.client as _Client,
+      config: runtime.config as z.infer<_ConfigSchema>,
+      store: runtime.store,
+    });
+    return {
+      ...resolved,
+      __platform: def.name,
+    } as PlatformUser<Def>;
+  };
+
+  const resolveStringUsers = async (args: unknown[]): Promise<unknown[]> => {
+    const convertArg = async (arg: unknown): Promise<unknown> => {
+      if (typeof arg === "string") {
+        return await resolveUserID(arg);
+      }
+      if (Array.isArray(arg)) {
+        return await Promise.all(arg.map(convertArg));
+      }
+      return arg;
+    };
+    return await Promise.all(args.map(convertArg));
   };
 
   const normalizeSpaceArgs = (
@@ -75,6 +101,7 @@ function createPlatformInstance<
         input: { userID },
         client: runtime.client as _Client,
         config: runtime.config as z.infer<_ConfigSchema>,
+        store: runtime.store,
       });
       return {
         ...resolved,
@@ -83,7 +110,8 @@ function createPlatformInstance<
     },
 
     async space(...args: unknown[]) {
-      const { users, params } = normalizeSpaceArgs(args);
+      const convertedArgs = await resolveStringUsers(args);
+      const { users, params } = normalizeSpaceArgs(convertedArgs);
       let parsedParams = params;
       if (params !== undefined && def.space.params) {
         parsedParams = def.space.params.parse(params);
@@ -92,65 +120,71 @@ function createPlatformInstance<
         input: { users, params: parsedParams },
         client: runtime.client as _Client,
         config: runtime.config as z.infer<_ConfigSchema>,
+        store: runtime.store,
       });
       const parsedSpace = def.space.schema
         ? def.space.schema.parse(resolved)
         : resolved;
       const spaceRef = {
+        ...(parsedSpace as Record<string, unknown>),
         id: parsedSpace.id,
         __platform: def.name,
       };
-      const typingCtx = {
+      const actionCtx = {
         space: spaceRef,
         client: runtime.client as _Client,
         config: runtime.config as z.infer<_ConfigSchema>,
+        store: runtime.store,
       };
-      return {
-        ...parsedSpace,
-        ...spaceRef,
-        send: async (...content: [ContentInput, ...ContentInput[]]) => {
-          const built = await resolveContents(content);
-          for (const item of built) {
-            await def.actions.send({
-              ...typingCtx,
-              content: item,
-            });
-          }
-        },
-        startTyping: async () => {
-          await def.actions.startTyping?.(typingCtx);
-        },
-        stopTyping: async () => {
-          await def.actions.stopTyping?.(typingCtx);
-        },
-        responding: async <T>(fn: () => T | Promise<T>): Promise<T> => {
-          await def.actions.startTyping?.(typingCtx);
-          try {
-            return await fn();
-          } finally {
-            await def.actions.stopTyping?.(typingCtx).catch(() => {});
-          }
-        },
-      } as PlatformSpace<Def>;
+      return buildSpace({
+        spaceRef,
+        extras: parsedSpace as Record<string, unknown>,
+        actionCtx,
+        definition: def as unknown as AnyPlatformDef,
+        client: runtime.client,
+        config: runtime.config,
+        store: runtime.store,
+      }) as PlatformSpace<Def>;
     },
   };
 
-  // Add flat event properties for custom events (non-messages)
+  // Add flat event properties for custom events. The core `messages` stream
+  // lives at the top level of the def — only the optional `events?` slot
+  // (custom platform events like presence, read receipts, etc.) is projected
+  // onto the instance here.
   const eventProperties: Record<string, AsyncIterable<unknown>> = {};
-  for (const eventName of Object.keys(def.events)) {
-    if (eventName === "messages") {
-      continue;
-    }
-    const producer = def.events[eventName] as
-      | ((ctx: { client: unknown; config: unknown }) => AsyncIterable<unknown>)
+  const customEvents = def.events ?? {};
+  for (const eventName of Object.keys(customEvents)) {
+    const producer = customEvents[eventName] as
+      | ((ctx: {
+          client: unknown;
+          config: unknown;
+          store: Store;
+        }) => AsyncIterable<unknown>)
       | undefined;
     if (producer) {
       eventProperties[eventName] = producer({
         client: runtime.client,
         config: runtime.config,
+        store: runtime.store,
       });
     }
   }
+
+  // Lazily subscribe to the platform's message broadcast on first read.
+  // Cached so `for await (const x of im.messages)` twice doesn't double-subscribe.
+  let messagesIterable:
+    | AsyncIterable<[PlatformSpace<Def>, InboundPlatformMessage<Def>]>
+    | undefined;
+  Object.defineProperty(base, "messages", {
+    enumerable: true,
+    get() {
+      messagesIterable ??= runtime.subscribeMessages() as AsyncIterable<
+        [PlatformSpace<Def>, InboundPlatformMessage<Def>]
+      >;
+      return messagesIterable;
+    },
+  });
 
   return Object.assign(base, eventProperties) as PlatformInstance<Def>;
 }
@@ -178,21 +212,26 @@ export function definePlatform<
       ? z.infer<_MessageSchema>
       : Record<never, never>
   >,
-  _Events extends {
-    messages: (ctx: {
-      client: _Client;
-      config: z.infer<_ConfigSchema>;
-    }) => AsyncIterable<_MessageType>;
-  } = {
-    messages: (ctx: {
-      client: _Client;
-      config: z.infer<_ConfigSchema>;
-    }) => AsyncIterable<_MessageType>;
-  },
+  _Events extends
+    | (Record<
+        string,
+        EventProducer<unknown, _Client, z.infer<_ConfigSchema>>
+      > & { messages?: never })
+    | undefined = undefined,
   _Static extends Record<string, unknown> = Record<never, never>,
 >(
   name: _Name,
-  def: Omit<
+  def: {
+    lifecycle: {
+      createClient: (
+        ctx: CreateClientContext<_ConfigSchema>
+      ) => Promise<_Client>;
+      destroyClient?: (ctx: {
+        client: NoInferValue<_Client>;
+        store: Store;
+      }) => Promise<void>;
+    };
+  } & Omit<
     PlatformDef<
       _Name,
       _ConfigSchema,
@@ -206,7 +245,7 @@ export function definePlatform<
       _MessageType,
       _Events
     >,
-    "name"
+    "lifecycle" | "name"
   > & { static?: _Static }
 ): Platform<
   PlatformDef<
@@ -302,6 +341,19 @@ export function definePlatform<
       __definition: fullDef as AnyPlatformDef,
     } satisfies PlatformProviderConfig<Def> as PlatformProviderConfig<Def>;
   };
+
+  narrower.is = ((input: unknown) => {
+    if (typeof input !== "object" || input === null) {
+      return false;
+    }
+    if ("__platform" in input) {
+      return (input as { __platform?: unknown }).__platform === name;
+    }
+    if ("platform" in input) {
+      return (input as { platform?: unknown }).platform === name;
+    }
+    return false;
+  }) as Platform<Def>["is"];
 
   if (def.static) {
     Object.assign(narrower, def.static);

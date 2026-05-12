@@ -1,13 +1,50 @@
-import {
-  createClient,
-  type WhatsAppClient,
-} from "@photon-ai/whatsapp-business";
+import { createClient } from "@photon-ai/whatsapp-business";
 import { definePlatform } from "../../platform/define";
-import { messages, reactToMessage, replyToMessage, send } from "./messages";
-import { configSchema, spaceSchema } from "./types";
+import { UnsupportedError } from "../../utils/errors";
+import { createCloudClients, disposeCloudAuth } from "./auth";
+import { messages, send } from "./messages";
+import {
+  configSchema,
+  isCloudConfig,
+  spaceSchema,
+  type WhatsAppClients,
+} from "./types";
 
 export const whatsappBusiness = definePlatform("WhatsApp Business", {
   config: configSchema,
+
+  lifecycle: {
+    createClient: async ({
+      config,
+      projectId,
+      projectSecret,
+    }): Promise<WhatsAppClients> => {
+      if (!isCloudConfig(config)) {
+        return [
+          createClient({
+            accessToken: config.accessToken,
+            appSecret: config.appSecret ?? "",
+            phoneNumberId: config.phoneNumberId,
+          }),
+        ];
+      }
+
+      if (!(projectId && projectSecret)) {
+        throw new Error(
+          "WhatsApp Business cloud mode requires projectId and projectSecret. " +
+            "Either pass credentials to Spectrum(), or provide direct credentials: " +
+            "whatsappBusiness.config({ accessToken, phoneNumberId })"
+        );
+      }
+
+      return await createCloudClients(projectId, projectSecret);
+    },
+
+    destroyClient: async ({ client }) => {
+      await disposeCloudAuth(client);
+      await Promise.all(client.map((c) => c.close()));
+    },
+  },
 
   user: {
     resolve: async ({ input }) => ({ id: input.userID }),
@@ -20,8 +57,10 @@ export const whatsappBusiness = definePlatform("WhatsApp Business", {
         throw new Error("WhatsApp space creation requires at least one user");
       }
       if (input.users.length > 1) {
-        throw new Error(
-          "WhatsApp Business API only supports 1:1 conversations"
+        throw UnsupportedError.action(
+          "createSpace",
+          "WhatsApp Business",
+          "only 1:1 conversations are supported"
         );
       }
       const user = input.users[0];
@@ -32,45 +71,8 @@ export const whatsappBusiness = definePlatform("WhatsApp Business", {
     },
   },
 
-  lifecycle: {
-    createClient: async ({ config }): Promise<WhatsAppClient> => {
-      return createClient({
-        accessToken: config.accessToken,
-        phoneNumberId: config.phoneNumberId,
-        appSecret: config.appSecret ?? "",
-      });
-    },
+  messages: ({ client }) => messages(client),
 
-    destroyClient: async ({ client }: { client: WhatsAppClient }) => {
-      await client.close();
-    },
-  },
-
-  events: {
-    messages: ({ client }) => messages(client as WhatsAppClient),
-  },
-
-  actions: {
-    send: async ({ space, content, client }) => {
-      await send(client as WhatsAppClient, space.id, content);
-    },
-
-    reactToMessage: async ({ space, messageId, reaction, client }) => {
-      await reactToMessage(
-        client as WhatsAppClient,
-        space.id,
-        messageId,
-        reaction
-      );
-    },
-
-    replyToMessage: async ({ space, messageId, content, client }) => {
-      await replyToMessage(
-        client as WhatsAppClient,
-        space.id,
-        messageId,
-        content
-      );
-    },
-  },
+  send: async ({ space, content, client }) =>
+    await send(client, space.id, content),
 });

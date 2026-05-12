@@ -6,6 +6,14 @@ out
 dist
 *.tgz
 
+# local scratch work (ad-hoc scripts, debugging, real-account experiments)
+tmp
+
+# copied from repo root by `build` so they ship with the npm package
+# (clean-publish strips all scripts from the staged package.json, so prepack/prepublish hooks never run)
+packages/spectrum-ts/README.md
+packages/spectrum-ts/LICENSE
+
 # code coverage
 coverage
 *.lcov
@@ -35,3 +43,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# test results
+test-results/
+
+# local backup of full telegram provider (pre-strip)
+telegram-full-backup/
